@@ -1,15 +1,23 @@
+// src/lib/hooks/useCuration.ts
 import { useState, useEffect } from "react";
 import { formatEther, parseEther } from "viem";
 import { useWallet } from "./useWallet";
 import { CONTRACTS, CURATE_ABI } from "@/contracts";
-import type { LoadingStates, CurationData } from "@/lib/types/index";
+import type {
+  LoadingStates,
+  CurationData,
+  ProjectLaunchData,
+} from "@/lib/types/index";
 
 export function useCuration(projectId: string) {
   const { account, isConnected, publicClient, walletClient } = useWallet();
   const [loading, setLoading] = useState<LoadingStates>({});
   const [curationData, setCurationData] = useState<CurationData | null>(null);
+  const [projectLaunchData, setProjectLaunchData] =
+    useState<ProjectLaunchData | null>(null);
   const [ipBalance, setIpBalance] = useState<string>("0");
   const [statusMessage, setStatusMessage] = useState<string>("");
+  const [ipId, setIpId] = useState<string>("");
 
   const showStatus = (message: string) => {
     setStatusMessage(message);
@@ -24,6 +32,7 @@ export function useCuration(projectId: string) {
     if (isConnected && account && publicClient) {
       loadCurationData();
       loadIpBalance();
+      loadProjectLaunchData();
     }
   }, [isConnected, account, publicClient, projectId]);
 
@@ -44,18 +53,83 @@ export function useCuration(projectId: string) {
   const loadCurationData = async () => {
     if (!publicClient || !account) return;
 
-    try {
-      // TODO: load real curation data from the contract
+    const ipId = await publicClient.readContract({
+      address: CONTRACTS.AscCurate,
+      abi: CURATE_ABI,
+      functionName: "getIpId",
+    });
+    setIpId(ipId);
 
+    const totalCommitted = await publicClient.readContract({
+      address: CONTRACTS.AscCurate,
+      abi: CURATE_ABI,
+      functionName: "getTotalDeposited",
+    });
+
+    console.log("Total committed:", formatEther(totalCommitted));
+
+    const userCommitted = await publicClient.readContract({
+      address: CONTRACTS.AscCurate,
+      abi: CURATE_ABI,
+      functionName: "getDepositedAmount",
+      args: [account],
+    });
+
+    console.log("User committed:", formatEther(userCommitted));
+
+    try {
       setCurationData({
-        totalCommitted: "663.88K",
-        userCommitted: "0",
+        totalCommitted: formatEther(totalCommitted),
+        userCommitted: formatEther(userCommitted),
         curationLimit: "2.25M",
         isActive: true,
         canClaim: false,
       });
     } catch (error) {
       console.error("Failed to load curation data:", error);
+    }
+  };
+
+  const loadProjectLaunchData = async () => {
+    if (!publicClient || !CONTRACTS.AscCurate) return;
+
+    try {
+      // Check if project has been launched by calling the getter functions
+      const [bioToken, stakingContract] = await Promise.all([
+        publicClient.readContract({
+          address: CONTRACTS.AscCurate,
+          abi: CURATE_ABI,
+          functionName: "getBioToken",
+        }) as Promise<string>,
+        publicClient.readContract({
+          address: CONTRACTS.AscCurate,
+          abi: CURATE_ABI,
+          functionName: "getStakingContract",
+        }) as Promise<string>,
+      ]);
+
+      // Check if addresses are not zero address (indicating project has been launched)
+      const isLaunched =
+        bioToken !== "0x0000000000000000000000000000000000000000" &&
+        stakingContract !== "0x0000000000000000000000000000000000000000";
+
+      if (isLaunched) {
+        setProjectLaunchData({
+          bioToken,
+          stakingContract,
+          transactionHash: "", // We don't have this from getter functions
+          isLaunched: true,
+        });
+      }
+    } catch (error) {
+      console.error("Failed to load project launch data:", error);
+      // If the call fails, assume project is not launched yet
+      setProjectLaunchData({
+        bioToken: "0x0000000000000000000000000000000000000000",
+        stakingContract: "0x0000000000000000000000000000000000000000",
+        transactionHash: "",
+        isLaunched: false,
+      });
     }
   };
 
@@ -144,10 +218,95 @@ export function useCuration(projectId: string) {
     }
   };
 
+  const launchProject = async (initData: {
+    fractionalTokenTemplate: string;
+    distributionContractTemplate: string;
+    admin?: string;
+    rewardToken?: string;
+  }) => {
+    if (!walletClient || !account) return;
+
+    // check if all required fields are provided
+    if (
+      !initData.fractionalTokenTemplate ||
+      !initData.distributionContractTemplate ||
+      !initData.admin ||
+      !initData.rewardToken
+    ) {
+      throw new Error("Missing required fields for project launch");
+    }
+
+    setLoadingState("launch", true);
+    try {
+      const hash = await walletClient.writeContract({
+        account,
+        address: CONTRACTS.AscCurate,
+        abi: CURATE_ABI,
+        functionName: "launchProject",
+        args: [
+          initData.fractionalTokenTemplate,
+          initData.distributionContractTemplate,
+          {
+            admin: initData.admin || account,
+            ipId: ipId,
+            rewardDistributionPeriod: 288000,
+            rewardToken: initData.rewardToken || CONTRACTS.StakingToken,
+            bioTokenAllocPoints: 100,
+          },
+        ],
+      });
+
+      console.log("Project launch transaction sent:", hash);
+      showStatus(
+        "Project launch transaction sent! Waiting for confirmation..."
+      );
+
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      console.log("Transaction confirmed:", receipt);
+      showStatus(
+        "Transaction confirmed. Loading deployed contract addresses..."
+      );
+
+      const [bioToken, stakingContract] = await Promise.all([
+        publicClient.readContract({
+          address: CONTRACTS.AscCurate,
+          abi: CURATE_ABI,
+          functionName: "getBioToken",
+        }) as Promise<string>,
+        publicClient.readContract({
+          address: CONTRACTS.AscCurate,
+          abi: CURATE_ABI,
+          functionName: "getStakingContract",
+        }) as Promise<string>,
+      ]);
+
+      const launchData: ProjectLaunchData = {
+        bioToken,
+        stakingContract,
+        transactionHash: hash,
+        isLaunched: true,
+      };
+
+      setProjectLaunchData(launchData);
+      showStatus("Project launched successfully!");
+
+      return launchData;
+    } catch (error: any) {
+      console.error("Failed to launch project:", error);
+      showStatus(
+        `Failed to launch project: ${error.message || "Unknown error"}`
+      );
+      throw error;
+    } finally {
+      setLoadingState("launch", false);
+    }
+  };
+
   return {
     // State
     loading,
     curationData,
+    projectLaunchData,
     ipBalance,
     statusMessage,
 
@@ -155,8 +314,10 @@ export function useCuration(projectId: string) {
     commitToCuration,
     withdrawFromCuration,
     claimRefund,
+    launchProject,
     loadCurationData,
     loadIpBalance,
+    loadProjectLaunchData,
     showStatus,
   };
 }
